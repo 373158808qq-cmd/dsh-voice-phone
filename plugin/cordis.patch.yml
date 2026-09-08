@@ -1,0 +1,5 @@
+# Bundle patch for dsh-voice-phone-ui-input.
+# The row id is deployment-local; the package name must match package.json.
+- insert:
+    - id: ui-voice-input
+      name: 'dsh-voice-phone-ui-input'

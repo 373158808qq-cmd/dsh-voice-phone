@@ -1,0 +1,22 @@
+# 个人音色隐私: 绝不入库
+voice-samples/*.wav
+voice-samples/*.txt
+voice-samples/manifest.json
+
+# 运行数据/日志
+runtime/
+*.log
+last_stop.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / 前端插件
+plugin/node_modules/
+node_modules/
+
+# 模型(体积大, 用下载脚本拉取)
+models/
