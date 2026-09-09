@@ -119,6 +119,38 @@ const ENGINE_CMDS = {
 	},
 };
 const managedProcs = {};
+// ---- 【API 模式】云端引擎状态：key 是否已连接(启用)。与本地进程启停物理隔离。
+// apiConnected = { stt: bool, tts: bool }；"连接"动作会做一次连通性测试,通过才置 true。
+const apiConnected = { stt: false, tts: false };
+// 从 settings 实时读某个 key(用户设置页填的 sttApiKey/ttsApiKey)。
+function readSettingsValue(field) {
+	try {
+		const cur = (voiceSettings.ready && voiceSettings.svc) ? (voiceSettings.svc.get(voiceSettings.ns) || {}) : {};
+		return String(cur[field] || "").trim();
+	} catch { return ""; }
+}
+// 【API】连通性测试：发一个最小请求到 OpenAI 兼容的 /v1/models(需 base_url)；无 base_url 时
+// 无法真正测通,按"填了 key"即视为可连接(保守,不误报失败)。这里只做 key 有效性测试。
+async function testApiKey(id) {
+	try {
+		const key = id === "stt" ? readSettingsValue("sttApiKey") : readSettingsValue("ttsApiKey");
+		if (!key) return { ok: false, error: "未填写 API Key" };
+		const base = id === "stt" ? (readSettingsValue("sttBaseUrl") || "") : (readSettingsValue("ttsBaseUrl") || "");
+		if (base) {
+			// 有 base_url → 真实调 /v1/models 测 key(返回 200/401 即 key 有效/无效)。
+			const ac = new AbortController();
+			const tm = setTimeout(() => ac.abort(), 15000);
+			const r = await fetch(new URL("/v1/models", base), { headers: { Authorization: "Bearer " + key }, signal: ac.signal });
+			clearTimeout(tm);
+			if (r.ok || r.status === 401) return { ok: true, note: "key 有效(HTTP " + r.status + ")" };
+			return { ok: false, error: "key 无效(HTTP " + r.status + ")" };
+		}
+		// 无 base_url：无法真正测连通,按填了 key 视为可用(保守)。
+		return { ok: true, note: "已填 key(未配置 base_url,连接视为已启用)" };
+	} catch (e) {
+		return { ok: false, error: "连通测试失败：" + String((e && e.message) || e) };
+	}
+}
 // TCP 探测某端口是否有服务在监听(1.2s 超时)。
 function probePort(port) {
 	return new Promise((resolve) => {
@@ -391,8 +423,10 @@ async function apply(ctx, config = {}) {
 		const zMod = await import("@deepseek-ai/schemastery");
 		const settingsMod = await import("@deepseek-ai/dsh-settings");
 		const z = zMod.default;
-		const { installSettingsSection, settingsNamespace } = settingsMod;
-		const NS = settingsNamespace("voice-input");
+		// 【DSH 0.1.2 兼容】新版 dsh-settings 移除了顶层 installSettingsSection/settingsNamespace 导出,
+		// 改为 SettingsProvider 实例方法 installSection(owner, ns, schema, entry, hooks),命名空间直接传字符串。
+		// 为了兼容新旧两种形态(旧包仍有顶层函数),这里做双分支:能用顶层函数用旧的,否则用 ctx.settings.installSection。
+		const NS = "voice-input";
 		const VoiceRef = z.object({
 			/** 音色唯一 id。 */
 			id: z.string().default(""),
@@ -414,6 +448,14 @@ async function apply(ctx, config = {}) {
 			sttApiKey: z.string().role("secret").default(""),
 			/** 云端 TTS(合成) API Key：可填独立 Key，或与 STT 同家共用填同一个。 */
 			ttsApiKey: z.string().role("secret").default(""),
+			/** 云端 STT(识别) API 服务地址(head, 形如 https://xxx/v1)。连通用;不填则不做真实连通测试。 */
+			sttBaseUrl: z.string().default(""),
+			/** 云端 TTS(合成) API 服务地址(head, 形如 https://xxx/v1)。连通用;不填则不做真实连通测试。 */
+			ttsBaseUrl: z.string().default(""),
+			/** 云端 TTS(合成)服务商(用于提示音色克隆是否支持: minimax/cosyvoice/siliconflow/openai/other)。 */
+			ttsVendor: z.string().default(""),
+			/** 云端 STT(识别)服务商(openai-compatible/minimax/cosyvoice/other)。 */
+			sttVendor: z.string().default(""),
 			/** TTS 模型。 */
 			ttsModel: z.string().default(""),
 			/** STT 模型。 */
@@ -431,11 +473,21 @@ async function apply(ctx, config = {}) {
 		});
 		// 在宿主注册 settings 命名空间，浏览器端 settingsScope.bind({namespace:"voice-input"})
 		// 才能读到 status:"ready"（否则 unavailable）。本插件宿主不消费这些值，仅需要命名空间存在，
-		// 因此 setSource/onChange 设为 no-op（官方要求这两个钩子必须存在，否则 installSettingsSection 会抛错）。
-		installSettingsSection(ctx, NS, Config, config ?? {}, {
-			setSource: () => {},
-			onChange: () => {}
-		});
+		// 因此 setSource/onChange 设为 no-op（官方要求这两个钩子必须存在，否则会抛错）。
+		// 【DSH 0.1.2 兼容】新版没有顶层 installSettingsSection → 用 ctx.settings.installSection。
+		const hooks = { setSource: () => {}, onChange: () => {} };
+		if (typeof settingsMod.installSettingsSection === "function") {
+			// 旧版 dsh-settings 形态(顶层函数)。
+			settingsMod.installSettingsSection(ctx, NS, Config, config ?? {}, hooks);
+		} else if (typeof settingsMod.SettingsProvider === "function") {
+			// 新版 dsh-settings 形态: 需通过 settings 服务的 provider 实例调用。
+			// ctx.inject(["settings"]) 拿到的 sctx.settings 是 SettingsProvider 实例, 有 installSection 方法。
+			ctx.inject(["settings"], (sctx) => {
+				if (sctx && sctx.settings && typeof sctx.settings.installSection === "function") {
+					sctx.settings.installSection(ctx, NS, Config, config ?? {}, hooks);
+				}
+			});
+		}
 		// 捕获 settings 服务句柄，供 commit/delete 写 voices（失败安全：拿不到则入库/删除返回错误）。
 		ctx.inject(["settings"], (sctx) => {
 			voiceSettings.svc = sctx.settings;
@@ -498,11 +550,20 @@ async function apply(ctx, config = {}) {
 				path: "/voice/models/status",
 				handler: async (req, res) => {
 					try {
+						// 【模式判定】显式读查询参数 mode(而不是靠 req.url.includes 猜)——req.url 在 DSH 各版本行为不同,
+						// 依赖 includes 容易误判导致"端口明明在监听却显示已停止"。
+						const isApi = (/[?&]mode=api(?:\&|$)/i.test(String(req.url || "")))
+							|| ((req.query && req.query.mode === "api") ? true : false);
 						const engines = {};
 						for (const id of Object.keys(ENGINE_PORTS)) {
-							engines[id] = { running: await probePort(ENGINE_PORTS[id]), managed: !!managedProcs[id] };
+							// 【API 模式】running = 该云端 key 是否已连接;managed = 是否寄管进程(本地才用)。
+							engines[id] = {
+								running: isApi ? !!apiConnected[id] : await probePort(ENGINE_PORTS[id]),
+								managed: !!managedProcs[id],
+								api: isApi,
+							};
 						}
-						jsonResponse(res, 200, { ok: true, engines });
+						jsonResponse(res, 200, { ok: true, engines, mode: isApi ? "api" : "local" });
 					} catch (err) {
 						ctx.logger?.warn?.(`dsh-client-ui-voice-input: /voice/models/status ${err?.message ?? err}`);
 						jsonResponse(res, 500, { ok: false, error: String(err?.message || err) });
@@ -520,13 +581,49 @@ async function apply(ctx, config = {}) {
 						const body = await parseJson(req);
 						const id = String(body.id || "");
 						const action = String(body.action || "");
+						const mode = String(body.mode || "local");
 						if (!ENGINE_PORTS[id]) { jsonResponse(res, 400, { ok: false, error: "unknown engine: " + id }); return; }
 						const port = ENGINE_PORTS[id];
+						// 【API 模式】启/禁 = 测 key 连通并标记/取消"已连接"。本地模式完全不受影响(保持原启停进程逻辑)。
+						if (mode === "api") {
+							if (action === "start") {
+								const t = await testApiKey(id);
+								if (!t.ok) { jsonResponse(res, 200, { ok: false, engine: id, running: false, error: t.error }); return; }
+								apiConnected[id] = true;
+								jsonResponse(res, 200, { ok: true, engine: id, running: true, note: t.note || "已连接" });
+								return;
+							}
+							if (action === "stop") {
+								apiConnected[id] = false;
+								jsonResponse(res, 200, { ok: true, engine: id, running: false, note: "已断开" });
+								return;
+							}
+							jsonResponse(res, 400, { ok: false, error: "bad action: " + action });
+							return;
+						}
 						if (action === "start") {
 							if (await probePort(port)) { jsonResponse(res, 200, { ok: true, engine: id, running: true, note: "已在运行" }); return; }
 							const cfg = ENGINE_CMDS[id];
 							try {
-								const proc = spawn(cfg.py, cfg.args, { windowsHide: true, cwd: path.dirname(cfg.py), stdio: ["ignore", "pipe", "pipe"] });
+								// 【选卡】实时读用户设置里选的显卡(deviceId, 形如 "gpu:0"/"gpu:1"/"auto"/"cpu"),
+								// 决定进程可见哪张卡: CUDA_VISIBLE_DEVICES 控制 PyTorch 用哪张 GPU(默认=第一张卡 0)。
+								// 必须从 settings 服务实时读(voiceSettings.svc.get)——不能只用启动时的 config 快照,
+								// 否则用户在设置页改的选卡值读不到, 模型仍跑第一张卡。
+								const env = { ...process.env };
+								let dev = String((config && config.deviceId) || "").trim();
+								try {
+									const cur = (voiceSettings.ready && voiceSettings.svc) ? (voiceSettings.svc.get(voiceSettings.ns) || {}) : {};
+									if (typeof cur.deviceId === "string" && cur.deviceId.trim()) dev = cur.deviceId.trim();
+								} catch {}
+								if (dev === "cpu") {
+									env.CUDA_VISIBLE_DEVICES = "";
+								} else {
+									const m = /^gpu:(\d+)$/.exec(dev);
+									if (m) env.CUDA_VISIBLE_DEVICES = m[1];
+									// auto/空 → 不设,交给 PyTorch 默认(第一张卡)
+								}
+								if (env.CUDA_VISIBLE_DEVICES !== void 0) ctx.logger?.info?.("[voice-engine] start " + id + " CUDA_VISIBLE_DEVICES=" + (env.CUDA_VISIBLE_DEVICES === "" ? "(空=CPU)" : env.CUDA_VISIBLE_DEVICES) + " (deviceId=" + dev + ")");
+								const proc = spawn(cfg.py, cfg.args, { windowsHide: true, cwd: path.dirname(cfg.py), stdio: ["ignore", "pipe", "pipe"], env });
 								managedProcs[id] = proc;
 								const log = (d) => { try { const s = String(d).trim(); if (s) ctx.logger?.info?.("[voice-engine " + id + "] " + s); } catch {} };
 								if (proc.stdout) proc.stdout.on("data", log);
