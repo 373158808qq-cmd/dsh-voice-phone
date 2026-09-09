@@ -521,7 +521,8 @@ window.__ModuleLoader__.load({
 		function getRecentConversationText(sessionId, maxNodes) {
 			try {
 				const snap = sessionsRef?.binding(sessionId)?.session?.getSnapshot();
-				const nodes = snap?.nodes || [];
+				// 【DSH 0.1.2 兼容】优先 useChat 缓存,回退旧快照。
+				const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (snap?.nodes || []);
 				const roles = [];
 				const limit = maxNodes || 8;
 				for (let i = nodes.length - 1; i >= 0 && roles.length < limit; i--) {
@@ -542,7 +543,8 @@ window.__ModuleLoader__.load({
 		function getCurrentTurnConversation(sessionId) {
 			try {
 				const snap = sessionsRef?.binding(sessionId)?.session?.getSnapshot();
-				const nodes = snap?.nodes || [];
+				// 【DSH 0.1.2 兼容】优先用 useChat 缓存(带 kind/seq),回退旧快照。
+				const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (snap?.nodes || []);
 				let lastUserIdx = -1;
 				for (let i = nodes.length - 1; i >= 0; i--) {
 					const n = nodes[i];
@@ -725,6 +727,16 @@ window.__ModuleLoader__.load({
 		let callSpeaker = null;
 		/** 【📞常驻引擎】待念段队列。 */
 		let callQueue = [];
+		/** 【DSH 0.1.2 兼容·引擎数据源缓存】新版 session.getSnapshot() 不再返回 nodes(旧版有,新版断),
+		*  而聊天节点列表(带 kind/seq)在新版只能经 React 的 useChat(s.legacy.nodes) 拿到。
+		*  引擎是非 React 常驻模块,拿不到 useChat —— 故用这个模块级缓存: 组件(MicButton/TelButton)的
+		*  useChat 拿到 legacy.nodes 时同步写入,引擎(callOnSnapshot/callArm/callDrive 等)从这里读。 */
+		let callChatNodesCache = [];
+		/** 【DSH 0.1.2 兼容】引擎读"流式输出文字"的缓存(新版 session.getSnapshot() 无 partial,数据在 useChat 的 legacy.partial)。
+		*  组件 useChat 拿到时同步写,引擎从这里读;回退旧 snapshot.partial。 */
+		let callPartialCache = null;
+		/** 【DSH 0.1.2 兼容】引擎读"运行中工具调用"的缓存(新版 session.getSnapshot() 无 runningCalls,数据在 useChat 的 legacy.runningCalls)。 */
+		let callRunningCallsCache = [];
 		/** 【📞常驻引擎】是否正在念一段。 */
 		let callSpeaking = false;
 		/** 【📞常驻引擎】本条回复是否已收尾(队列播空即结束)。 */
@@ -864,7 +876,8 @@ window.__ModuleLoader__.load({
 				const s = sessionsRef?.binding(callOwnerId)?.session;
 				if (s) latest = s.getSnapshot();
 			} catch {}
-			const nodes = latest.nodes || [];
+			// 【DSH 0.1.2 兼容】优先 useChat 缓存,回退旧快照。
+			const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (latest.nodes || []);
 			let node = null;
 			for (let i = nodes.length - 1; i >= 0; i--) {
 				const n = nodes[i];
@@ -896,7 +909,8 @@ window.__ModuleLoader__.load({
 			callOwnerId = ownerId;
 			callArmedForSeq = afterSeq;
 			const snap = sessionsRef?.binding(ownerId)?.session?.getSnapshot();
-			const nodes = snap?.nodes || [];
+			// 【DSH 0.1.2 兼容】优先 useChat 缓存,回退旧快照。
+			const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (snap?.nodes || []);
 			let maxAsst = -1;
 			for (const n of nodes) if (n.kind === "assistant" && typeof n.seq === "number" && n.seq < afterSeq && n.seq > maxAsst) maxAsst = n.seq;
 			callReplySeq = maxAsst;
@@ -921,9 +935,10 @@ window.__ModuleLoader__.load({
 		/** 驱动：B1 边生成边逐句念 + 收尾判定(从 A 的 snapshot 读)。 */
 		function callDriveOnSnapshot(snap) {
 			if (!callArmed) return;
-			const partial = snap.partial;
+			// 【DSH 0.1.2 兼容】partial/runningCalls 新版 session.getSnapshot() 已无(在 useChat legacy),优先用缓存,回退快照。
+			const partial = (callPartialCache !== null && callPartialCache !== void 0) ? callPartialCache : snap.partial;
 			const running = snap.running;
-			const runningCalls = snap.runningCalls || [];
+			const runningCalls = (callRunningCallsCache && callRunningCallsCache.length > 0) ? callRunningCallsCache : (snap.runningCalls || []);
 			const text = extractPartialText(partial);
 			if (text.trim()) callLastContentAt = Date.now();
 			if (!text.trim()) {
@@ -978,7 +993,8 @@ window.__ModuleLoader__.load({
 			const session = bind?.session;
 			if (!session) return;
 			const snap = session.getSnapshot();
-			const nodes = snap.nodes || [];
+			// 【DSH 0.1.2 兼容】新版 session.getSnapshot() 无 nodes;优先用 useChat 缓存(带 kind/seq),回退旧快照。
+			const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (snap.nodes || []);
 			let maxUser = -1;
 			for (const n of nodes) if (n.kind === "user" && typeof n.seq === "number" && n.seq > maxUser) maxUser = n.seq;
 			// 【挂断隔离新输入】只有"通话中(callActive)"才接受新 user 输入并武装;挂断后新说的话/环境声不当作你的输入。
@@ -996,7 +1012,8 @@ window.__ModuleLoader__.load({
 			callActive = true;
 			// 全局静音是【用户持久选择】,开/挂通话都不自动复位(按钮状态一目了然,不会误以为没声音)。
 			const snap = sessionsRef?.binding(ownerId)?.session?.getSnapshot();
-			const nodes = snap?.nodes || [];
+			// 【DSH 0.1.2 兼容】优先 useChat 缓存,回退旧快照。
+			const nodes = (callChatNodesCache && callChatNodesCache.length > 0) ? callChatNodesCache : (snap?.nodes || []);
 			let maxUser = -1;
 			for (const n of nodes) if (n.kind === "user" && typeof n.seq === "number" && n.seq > maxUser) maxUser = n.seq;
 			callLastUserSeq = maxUser;
@@ -1211,9 +1228,13 @@ window.__ModuleLoader__.load({
 		* conversation standard kit; `language`/`interimResults` come from the
 		* plugin's injected config face.
 		*/
-		function MicButton({ useInput, useSession, inputActions, t, language, interimResults, cancel, sessionId }) {
+		function MicButton({ useInput, useSession, useChat, inputActions, t, language, interimResults, cancel, sessionId }) {
 			const draft = useInput((state) => state?.draft ?? "");
-			const chatNodes = useSession((state) => state?.chat?.legacy?.nodes ?? []);
+			// 【DSH 0.1.2 兼容】新版 useSession 返回 SessionSnapshot(无 chat.legacy.nodes);
+			// 聊天节点列表(带 kind/seq)在新版由 useChat 提供(s.legacy.nodes)。优先用 useChat,缺失回退 useSession。
+			const chatNodes = (useChat && typeof useChat === "function")
+				? useChat((state) => state?.legacy?.nodes ?? [])
+				: useSession((state) => state?.chat?.legacy?.nodes ?? []);
 			const chatNodesRef = (0, react.useRef)(chatNodes);
 			chatNodesRef.current = chatNodes;
 			const [micState, setMicState] = (0, react.useState)("idle");
@@ -1258,11 +1279,16 @@ window.__ModuleLoader__.load({
 				}
 			};
 			/** The streaming reply partial, subscribed so reply reading starts while the model is still generating. */
-			const partial = useSession((state) => state?.partial ?? null);
+			// 【DSH 0.1.2 兼容】partial/runningCalls 新版 useSession(SessionSnapshot) 已无(在 useChat legacy);优先 useChat,回退 useSession。
+			const partial = (useChat && typeof useChat === "function")
+				? (useChat((state) => state?.legacy?.partial ?? null) ?? null)
+				: useSession((state) => state?.partial ?? null);
 			/** Whether the current reply is still generating (drives分段 vs 完整收尾的判断). */
 			const running = useSession((state) => state?.running ?? false);
 			/** 当前正在运行的工具调用(如 pwsh 等)。非空=agent 还在跑工具,任务未完成。 */
-			const runningCalls = useSession((state) => state?.runningCalls ?? []);
+			const runningCalls = (useChat && typeof useChat === "function")
+				? (useChat((state) => state?.legacy?.runningCalls ?? []) ?? [])
+				: useSession((state) => state?.runningCalls ?? []);
 			/** Whether reading paused a live recognizer (so stopping reading must resume it). */
 			const readingPausedRef = (0, react.useRef)(false);
 			/** Reply segments queued for sequential reading. */
@@ -2119,9 +2145,42 @@ window.__ModuleLoader__.load({
 				})
 			});
 		}
-		function TelButton({ useSession, inputActions, t, sessionId, sessions }) {
+		function TelButton({ useSession, useChat, inputActions, t, sessionId, sessions }) {
 			const [callOn, setCallOn] = (0, react.useState)(false);
 			const [modeLabel, setModeLabel] = (0, react.useState)("");
+			// 【DSH 0.1.2 兼容·引擎数据源】新版 useSession 返回 SessionSnapshot(无 chat.legacy.nodes),
+			// 聊天节点列表(带 kind/seq)在新版由 useChat 提供(s.legacy.nodes)。这里监听它,检测"新用户消息"→驱动常驻引擎朗读。
+			// 引擎(callOnSnapshot 等)仍走 session.getSnapshot()(模块级非常驻),但新版那条已断 —— 所以在组件层补一个
+			// useChat 监听,把"新消息"交给引擎 callArm(跟 callOnSnapshot 等价,且走新版官方数据通道)。
+			const chatNodes = (useChat && typeof useChat === "function")
+				? useChat((state) => state?.legacy?.nodes ?? [])
+				: (useSession ? useSession((state) => state?.chat?.legacy?.nodes ?? []) : []);
+			// 【DSH 0.1.2 兼容】useChat 拿到聊天节点/流式文字/运行工具 → 同步写入模块级缓存,供非 React 常驻引擎读取。
+			// 新版 session.getSnapshot() 已无 nodes/partial/runningCalls(全在 useChat 的 legacy),不缓存引擎就读不到。
+			try { callChatNodesCache = chatNodes; } catch {}
+			if (useChat && typeof useChat === "function") {
+				try {
+					callPartialCache = useChat((state) => state?.legacy?.partial ?? null) ?? null;
+					callRunningCallsCache = useChat((state) => state?.legacy?.runningCalls ?? []) ?? [];
+				} catch {}
+			}
+			const lastUserSeqRef = (0, react.useRef)(-1);
+			(0, react.useEffect)(() => {
+				// 只在📞通话中生效(getUserMedia 提交的 turn → callArm)。非通话时不为无害。
+				if (!callActive || !callOwnerId) return;
+				if (voiceInputSessionId !== callOwnerId) return;
+				let maxUser = -1;
+				for (const n of chatNodes) if (n && n.kind === "user" && typeof n.seq === "number" && n.seq > maxUser) maxUser = n.seq;
+				if (maxUser < 0) return;
+				// 只处理"比引擎已处理基线更新的"新 user 消息(防历史/重复)。
+				if (maxUser > lastUserSeqRef.current) {
+					lastUserSeqRef.current = maxUser;
+					// 与 callArm 内的"同 seq 防重"一致: 只有真正的新输入才武装。
+					if (callArmedForSeq !== maxUser) {
+						try { callArm(callOwnerId, maxUser); } catch (e) { console.warn("[dsh-voice] tel useChat arm failed", e?.message); }
+					}
+				}
+			}, [chatNodes]);
 			// 【图标必刷新】isOwner/occupied 依赖模块级 voiceCallActive。原来用 forceRender(空 tick)手动强制刷新,
 			// 但它在 React 里偶尔会被丢弃(长通话刷新频繁时) → 图标卡在旧颜色。改用 useSyncExternalStore:
 			// 订阅"通话状态外部源",状态一变必定重渲染,绝不被丢弃。isOwner/occupied 直接用快照重算。
