@@ -1212,8 +1212,8 @@ window.__ModuleLoader__.load({
 		* plugin's injected config face.
 		*/
 		function MicButton({ useInput, useSession, inputActions, t, language, interimResults, cancel, sessionId }) {
-			const draft = useInput((state) => state.draft);
-			const chatNodes = useSession((state) => state.chat.legacy.nodes);
+			const draft = useInput((state) => state?.draft ?? "");
+			const chatNodes = useSession((state) => state?.chat?.legacy?.nodes ?? []);
 			const chatNodesRef = (0, react.useRef)(chatNodes);
 			chatNodesRef.current = chatNodes;
 			const [micState, setMicState] = (0, react.useState)("idle");
@@ -1258,11 +1258,11 @@ window.__ModuleLoader__.load({
 				}
 			};
 			/** The streaming reply partial, subscribed so reply reading starts while the model is still generating. */
-			const partial = useSession((state) => state.partial);
+			const partial = useSession((state) => state?.partial ?? null);
 			/** Whether the current reply is still generating (drives分段 vs 完整收尾的判断). */
-			const running = useSession((state) => state.running);
+			const running = useSession((state) => state?.running ?? false);
 			/** 当前正在运行的工具调用(如 pwsh 等)。非空=agent 还在跑工具,任务未完成。 */
-			const runningCalls = useSession((state) => state.runningCalls);
+			const runningCalls = useSession((state) => state?.runningCalls ?? []);
 			/** Whether reading paused a live recognizer (so stopping reading must resume it). */
 			const readingPausedRef = (0, react.useRef)(false);
 			/** Reply segments queued for sequential reading. */
@@ -2504,9 +2504,10 @@ window.__ModuleLoader__.load({
 			const [voicePreparing, setVoicePreparing] = (0, react.useState)("");
 			// 【模型开关】本地引擎启停（9881 STT / 9882 TTS）；状态来自 /voice/models/status（端口探测）。
 			// pending = {id, action}：点击后立即显示"启动中…/停止中…"，完成后再变"已启动/已停止"。
+			// 【engineMode 在下方 valueAt 定义后才定义(见下)——必须先有 valueAt,否则设置页渲染抛 TDZ 错误变成空白】。
 			const [engState, setEngState] = (0, react.useState)({ status: "loading", engines: null, err: "", pending: null });
 			const loadEngines = () => {
-				fetch("/voice/models/status")
+				fetch("/voice/models/status" + (engineMode === "api" ? "?mode=api" : ""))
 					.then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
 					.then((j) => {
 						if (j && j.ok && j.engines) setEngState((p) => ({ status: "ok", engines: j.engines, err: "", pending: null }));
@@ -2518,16 +2519,25 @@ window.__ModuleLoader__.load({
 				if (engState.pending && engState.pending.id) return; // 一次只处理一个，防连点
 				const cur = engState.engines && engState.engines[id];
 				const action = cur && cur.running ? "stop" : "start";
+				// 【API 模式·同一家联动】STT/TTS 填的 key 相同(且非空) = 同一家 → 一个启动全启动/一个禁用全禁用。
+				// 本地模式不联动(各自独立,保持你验证过的启停完美逻辑)。
+				const sameVendor = (engineMode === "api"
+					&& String(valueAt("sttApiKey") || "").trim().length > 0
+					&& String(valueAt("sttApiKey") || "").trim() === String(valueAt("ttsApiKey") || "").trim());
+				const ids = sameVendor ? ["stt", "tts"] : [id];
 				// 【即时反馈】点击立即显示"启动中…/停止中…"（不等后台完成）。
-				setEngState((p) => ({ ...p, status: "ok", pending: { id, action }, err: "" }));
+				setEngState((p) => ({ ...p, status: "ok", pending: { id: sameVendor ? "stt+tts" : id, action }, err: "" }));
 				try {
-					const r = await fetch("/voice/models/control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, action }) });
-					const j = await r.json().catch(() => ({}));
-					if (!r.ok || !j.ok) {
-						setEngState((p) => ({ status: "error", engines: p.engines, err: (j && j.error) || "操作失败", pending: null }));
-						return;
+					// 联动时先按顺序逐个处理,任一失败即停(避免一部分成功一部分失败状态混乱)
+					for (const eid of ids) {
+						const r = await fetch("/voice/models/control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: eid, action, mode: engineMode }) });
+						const j = await r.json().catch(() => ({}));
+						if (!r.ok || !j.ok) {
+							setEngState((p) => ({ status: "error", engines: p.engines, err: (j && j.error) || "操作失败", pending: null }));
+							return;
+						}
 					}
-					loadEngines(); // 完成后刷新状态 → 显示"已启动/已停止"
+					loadEngines(); // 完成后刷新状态 → 显示"已启动/已停止/已连接/已断开"
 				} catch (e) {
 					setEngState((p) => ({ status: "error", engines: p.engines, err: String((e && e.message) || e), pending: null }));
 				}
@@ -2543,6 +2553,8 @@ window.__ModuleLoader__.load({
 			}
 			const value = (snap.value && typeof snap.value === "object") ? snap.value : {};
 			const valueAt = (key) => (draft[key] === void 0 ? (value[key] ?? "") : draft[key]);
+			// 【engineMode 定义在 valueAt 之后(必须有 valueAt 才能读)】供 loadEngines/toggleEngine/engineRow 用。
+			const engineMode = String(valueAt("engineMode")) === "api" ? "api" : "local";
 			const setField = (key, val) => { setDraft((prev) => ({ ...prev, [key]: val })); setSaved(false); };
 			const save = () => {
 				for (const key of Object.keys(draft)) {
@@ -2557,17 +2569,18 @@ window.__ModuleLoader__.load({
 			// ---- 音色标签（真功能）：已训练列表 + 上传/训练/确认/入库。只在"音色"标签渲染，不影响其它标签/已验证功能。 ----
 			const btnStyle = { whiteSpace: "nowrap", padding: "4px 10px", borderRadius: 6, border: "1px solid #ccc", background: "transparent", color: "inherit", cursor: "pointer", fontSize: 12 };
 			const btnPrimary = { whiteSpace: "nowrap", padding: "6px 16px", borderRadius: 6, border: "none", background: "#4d6bfe", color: "#fff", cursor: "pointer", fontSize: 13 };
-			// 【模型开关】引擎行：名称 + 状态（已启动/已停止/启动中…/停止中…）+ 启动/停止按钮。
+			// 【模型开关】引擎行：名称 + 状态（已启动/已停止/已连接/已断开）+ 启停按钮。
+			// 本地模式 = 启停本地服务进程；API 模式 = 连/断对应云端 API(key 相同=同一家,联动)。
 			const engineRow = (id, label) => {
 				const e = engState.engines && engState.engines[id];
 				const running = !!(e && e.running);
-				const pend = (engState.pending && engState.pending.id === id) ? engState.pending : null;
-				const stateText = pend ? (pend.action === "start" ? "启动中…" : "停止中…") : (running ? "已启动" : "已停止");
+				const pend = (engState.pending && engState.pending.id) === id ? engState.pending : null;
+				const stateText = pend ? (pend.action === "start" ? "启动中…" : "停止中…") : (running ? (engineMode === "api" ? "已连接" : "已启动") : (engineMode === "api" ? "已断开" : "已停止"));
 				const stateColor = pend ? "#e67e22" : (running ? "#2e7d32" : "#999");
 				return (0, react_jsx_runtime.jsxs)("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }, children: [
 					(0, react_jsx_runtime.jsx)("span", { style: { flex: 1, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: label }),
 					(0, react_jsx_runtime.jsx)("span", { style: { fontSize: 12, color: stateColor, whiteSpace: "nowrap" }, children: stateText }),
-					(0, react_jsx_runtime.jsx)("button", { type: "button", onClick: () => toggleEngine(id), disabled: engState.status === "loading" || !!engState.pending, style: btnStyle, children: pend ? (pend.action === "start" ? "启动中…" : "停止中…") : (running ? "停止" : "启动") })
+					(0, react_jsx_runtime.jsx)("button", { type: "button", onClick: () => toggleEngine(id), disabled: engState.status === "loading" || !!engState.pending, style: btnStyle, children: pend ? (pend.action === "start" ? "启动中…" : "停止中…") : (engineMode === "api" ? (running ? "断开" : "连接") : (running ? "停止" : "启动")) })
 				] });
 			};
 			const voiceList = Array.isArray(value.voices) ? value.voices : [];
@@ -2699,8 +2712,7 @@ window.__ModuleLoader__.load({
 					})
 				]
 			});
-			// 引擎模式 → 提示文案（本地=设备+本地引擎；API=填 key）。
-			const engineMode = String(valueAt("engineMode")) === "api" ? "api" : "local";
+			// 引擎模式 → 提示文案（本地=设备+本地引擎；API=填 key）。【engineMode 已在上方定义,此处仅保留注释】
 			// 设备下拉：用宿主端真实检测的显卡/CPU 名称（nvidia-smi + os.cpus）；缺省或失败回退到自动+CPU。
 			const deviceLabel = (id) => {
 				if (id === "auto") return tf("settings.device.auto");
@@ -2731,6 +2743,11 @@ window.__ModuleLoader__.load({
 				return id;
 			};
 			const modelOptions = (kind) => {
+				// 【API 模式联动】选 API 时 TTS/STT 模型下拉只保留"云端"(锁定)。本地模式显示本地检测到的模型。
+				if (engineMode === "api") {
+					const cloudLabel = kind === "tts" ? tf("settings.tts.cloud") : tf("settings.stt.cloud");
+					return [["cloud", cloudLabel]];
+				}
 				const availIds = (modelState.models || []).filter((m) => m.kind === kind && m.available).map((m) => m.id);
 				const opts = availIds.map((id) => [id, modelLabel(id)]);
 				const cloudLabel = kind === "tts" ? tf("settings.tts.cloud") : tf("settings.stt.cloud");
@@ -2742,6 +2759,17 @@ window.__ModuleLoader__.load({
 			const ttsFallback = ttsOptions[0] ? ttsOptions[0][0] : "cloud";
 			const sttFallback = sttOptions[0] ? sttOptions[0][0] : "cloud";
 			const modelHint = modelState.status === "loading" ? tf("settings.detect.loading") : (modelState.status === "error" ? tf("settings.detect.failed") : null);
+			// 【TTS 服务商 → 音色克隆支持提示】按已知情况标: 支持/不支持/需确认(不误导用户)。
+			// 依据: MiniMax/阿里云CosyVoice 有克隆API; OpenAI 官方无克隆; 硅基流动的克隆支持随模型/接口而异(需确认)。
+			const ttsVendorSel = String(valueAt("ttsVendor") || "");
+			const ttsVendorCloneSupport = ttsVendorSel === "minimax" || ttsVendorSel === "cosyvoice" ? "yes"
+				: ttsVendorSel === "openai" ? "no"
+				: ttsVendorSel === "" ? "none"
+				: "maybe"; // siliconflow/other → 需确认
+			const ttsVendorHint = ttsVendorCloneSupport === "yes" ? tf("settings.api.cloneYes")
+				: ttsVendorCloneSupport === "no" ? tf("settings.api.cloneNo")
+				: ttsVendorCloneSupport === "maybe" ? tf("settings.api.cloneMaybe")
+				: tf("settings.api.cloneNone");
 			// 各标签的实际控件（都经 valueAt/setField 读写 scope）。
 			const renderTabs = (key) => {
 				if (key === "voice") {
@@ -2766,23 +2794,66 @@ window.__ModuleLoader__.load({
 						selectField("ttsModel", tf("settings.field.ttsModel"), ttsOptions, ttsFallback),
 						selectField("sttModel", tf("settings.field.sttModel"), sttOptions, sttFallback),
 						(0, react_jsx_runtime.jsxs)("div", { style: { marginTop: 16, borderTop: "1px solid #eee", paddingTop: 12 }, children: [
-							(0, react_jsx_runtime.jsx)("div", { style: labelStyle, children: "本地引擎开关" }),
-							(0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: "停止后语音识别/合成暂不可用（省显存）；启动后首次调用约需 10 秒加载模型。" }),
+							(0, react_jsx_runtime.jsx)("div", { style: labelStyle, children: engineMode === "api" ? "云端 API 连接" : "本地引擎开关" }),
+							(0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: engineMode === "api"
+								? "连接=检测该 API Key 是否有效并启用；断开=不再使用该云端。STT/TTS 填的 Key 相同(同一家)时，一个连接/断开会同时作用于两者。"
+								: "停止后语音识别/合成暂不可用（省显存）；启动后首次调用约需 10 秒加载模型。" }),
 							engState.err ? (0, react_jsx_runtime.jsx)("div", { style: { color: "#c62828", fontSize: 12, marginBottom: 8 }, children: engState.err }) : null,
-							engineRow("stt", "STT 识别（SenseVoice · 9881）"),
-							engineRow("tts", "TTS 合成（CosyVoice · 9882）")
+							engineRow("stt", engineMode === "api" ? "STT 识别（云端 API）" : "STT 识别（SenseVoice · 9881）"),
+							engineRow("tts", engineMode === "api" ? "TTS 合成（云端 API）" : "TTS 合成（CosyVoice · 9882）")
 						] })
 					] });
 				}
 				return (0, react_jsx_runtime.jsxs)("div", { children: [
+					// 【API 模式·双 Key】STT/TTS 可能不同云端,各填各的 key。仅引擎模式=API 时可编辑(本地模式禁用)。
+					// 按 key 是否相同判"同一家":相同 → 下方模型启禁用联动(一个启全启/一个禁全禁)。
+					...(engineMode !== "api" ? [(0, react_jsx_runtime.jsx)("div", { style: { ...hintStyle, color: "#c62828" }, children: tf("settings.api.needApiMode") })] : []),
+					// 【服务商选择 + 克隆支持提示】先选 TTS/STT 服务商,系统按已知情况提示该家是否支持音色克隆,
+					// 避免用户以为能用克隆结果不能(不支持/需确认的会明确提示,只能用默认音色)。
 					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
-						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.field.apiKey") }),
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.ttsVendor") }),
+						(0, react_jsx_runtime.jsxs)("select", {
+							value: String(valueAt("ttsVendor") || ""),
+							onChange: (e) => setField("ttsVendor", e.target.value),
+							disabled: engineMode !== "api",
+							style: { ...inputStyle, opacity: engineMode !== "api" ? 0.5 : 1 },
+							children: [
+								(0, react_jsx_runtime.jsx)("option", { value: "", style: { color: "#1a1a1a", background: "#ffffff" }, children: tf("settings.api.vendorNone") }),
+								(0, react_jsx_runtime.jsx)("option", { value: "minimax", style: { color: "#1a1a1a", background: "#ffffff" }, children: "MiniMax（支持音色克隆）" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "cosyvoice", style: { color: "#1a1a1a", background: "#ffffff" }, children: "阿里云 CosyVoice（支持克隆）" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "siliconflow", style: { color: "#1a1a1a", background: "#ffffff" }, children: "硅基流动（克隆支持需确认）" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "openai", style: { color: "#1a1a1a", background: "#ffffff" }, children: "OpenAI 官方（不支持克隆）" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "other", style: { color: "#1a1a1a", background: "#ffffff" }, children: tf("settings.api.vendorOther") })
+							]
+						})
+					] }),
+					// 【克隆支持提示】按 TTS 服务商决定:支持/不支持/需确认。
+					(0, react_jsx_runtime.jsx)("div", { style: { ...hintStyle, marginTop: -8, marginBottom: 8, color: ttsVendorCloneSupport === "yes" ? "#2e7d32" : (ttsVendorCloneSupport === "no" ? "#c62828" : "#e67e22") }, children: ttsVendorHint }),
+					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.sttVendor") }),
+						(0, react_jsx_runtime.jsxs)("select", {
+							value: String(valueAt("sttVendor") || ""),
+							onChange: (e) => setField("sttVendor", e.target.value),
+							disabled: engineMode !== "api",
+							style: { ...inputStyle, opacity: engineMode !== "api" ? 0.5 : 1 },
+							children: [
+								(0, react_jsx_runtime.jsx)("option", { value: "", style: { color: "#1a1a1a", background: "#ffffff" }, children: tf("settings.api.vendorNone") }),
+								(0, react_jsx_runtime.jsx)("option", { value: "openai-compatible", style: { color: "#1a1a1a", background: "#ffffff" }, children: "OpenAI 兼容语音识别" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "minimax", style: { color: "#1a1a1a", background: "#ffffff" }, children: "MiniMax" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "cosyvoice", style: { color: "#1a1a1a", background: "#ffffff" }, children: "阿里云 CosyVoice" }),
+								(0, react_jsx_runtime.jsx)("option", { value: "other", style: { color: "#1a1a1a", background: "#ffffff" }, children: tf("settings.api.vendorOther") })
+							]
+						})
+					] }),
+					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.sttKey") }),
 						(0, react_jsx_runtime.jsxs)("div", { style: { display: "flex", gap: 8 }, children: [
 							(0, react_jsx_runtime.jsx)("input", {
 								type: showKey ? "text" : "password",
-								value: String(valueAt("apiKey")),
-								onChange: (e) => setField("apiKey", e.target.value),
-								style: { ...inputStyle, flex: 1 }
+								value: String(valueAt("sttApiKey")),
+								onChange: (e) => setField("sttApiKey", e.target.value),
+								disabled: engineMode !== "api",
+								style: { ...inputStyle, flex: 1, opacity: engineMode !== "api" ? 0.5 : 1 }
 							}),
 							(0, react_jsx_runtime.jsx)("button", {
 								type: "button",
@@ -2791,6 +2862,47 @@ window.__ModuleLoader__.load({
 								children: showKey ? tf("settings.api.hideKey") : tf("settings.api.showKey")
 							})
 						] })
+					] }),
+					(0, react_jsx_runtime.jsx)("div", { style: { ...hintStyle, marginTop: -8, marginBottom: 8 }, children: tf("settings.api.baseUrlNote") }),
+					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.sttUrl") }),
+						(0, react_jsx_runtime.jsx)("input", {
+							type: "text",
+							value: String(valueAt("sttBaseUrl")),
+							onChange: (e) => setField("sttBaseUrl", e.target.value),
+							disabled: engineMode !== "api",
+							placeholder: "https://api.example.com/v1",
+							style: { ...inputStyle, opacity: engineMode !== "api" ? 0.5 : 1 }
+						})
+					] }),
+					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.ttsKey") }),
+						(0, react_jsx_runtime.jsxs)("div", { style: { display: "flex", gap: 8 }, children: [
+							(0, react_jsx_runtime.jsx)("input", {
+								type: showKey ? "text" : "password",
+								value: String(valueAt("ttsApiKey")),
+								onChange: (e) => setField("ttsApiKey", e.target.value),
+								disabled: engineMode !== "api",
+								style: { ...inputStyle, flex: 1, opacity: engineMode !== "api" ? 0.5 : 1 }
+							}),
+							(0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								onClick: () => setShowKey((v) => !v),
+								style: { whiteSpace: "nowrap", padding: "6px 10px", borderRadius: 6, border: "1px solid #ccc", background: "transparent", color: "inherit", cursor: "pointer", fontSize: 12 },
+								children: showKey ? tf("settings.api.hideKey") : tf("settings.api.showKey")
+							})
+						] })
+					] }),
+					(0, react_jsx_runtime.jsxs)("label", { style: fieldWrap, children: [
+						(0, react_jsx_runtime.jsx)("span", { style: labelStyle, children: tf("settings.api.ttsUrl") }),
+						(0, react_jsx_runtime.jsx)("input", {
+							type: "text",
+							value: String(valueAt("ttsBaseUrl")),
+							onChange: (e) => setField("ttsBaseUrl", e.target.value),
+							disabled: engineMode !== "api",
+							placeholder: "https://api.example.com/v1",
+							style: { ...inputStyle, opacity: engineMode !== "api" ? 0.5 : 1 }
+						})
 					] }),
 					(0, react_jsx_runtime.jsx)("div", { style: hintStyle, children: tf("settings.api.note") })
 				] });
@@ -2875,6 +2987,20 @@ window.__ModuleLoader__.load({
 			"settings.api.note": "仅在引擎模式为「API」（走云端）时需要填写。",
 			"settings.api.showKey": "显示",
 			"settings.api.hideKey": "隐藏",
+			"settings.api.sttKey": "STT 识别 API Key",
+			"settings.api.ttsKey": "TTS 合成 API Key",
+			"settings.api.sttUrl": "STT API 服务地址（可选）",
+			"settings.api.ttsUrl": "TTS API 服务地址（可选）",
+			"settings.api.baseUrlNote": "服务地址填 API 的根地址（如 https://api.xxx.com/v1），留空则只校验 Key 是否填写、不做真实连通测试。",
+			"settings.api.needApiMode": "当前引擎模式为「本地」。需先在「模型」页把引擎模式切为 API，才能填写云端 Key。",
+			"settings.api.ttsVendor": "TTS 云端服务商",
+			"settings.api.sttVendor": "STT 云端服务商",
+			"settings.api.vendorNone": "（未选择）",
+			"settings.api.vendorOther": "其它/自定义（需自行确认）",
+			"settings.api.cloneYes": "✓ 该 TTS 服务支持音色克隆：可上传你的参考音频克隆（云端模式可用你的声音）。",
+			"settings.api.cloneNo": "✗ 该 TTS 服务（OpenAI 官方）不支持音色克隆：只能用默认音色。",
+			"settings.api.cloneMaybe": "？ 该 TTS 服务的音色克隆支持随模型/接口而异：请自行确认；若确认支持克隆，把参考音频按该家文档上传。",
+			"settings.api.cloneNone": "请先选择 TTS 服务商，才知道是否支持音色克隆。",
 			"settings.detect.loading": "正在检测本机设备/模型…",
 			"settings.detect.failed": "检测失败，已用默认项",
 			"settings.voice.title": "已训练音色",
@@ -3020,11 +3146,10 @@ window.__ModuleLoader__.load({
 				locale: NS,
 				inject: (sessionId) => ({
 					sessionId,
-					// 【模型接口修正】ctx.sessions 没有模型读写接口(models/selectModel 不存在) → 之前必报 not a function。
-					// 真正能用的是 ctx.get("connection").api.sessions(官方 ui-model-selection 同款 RPC wire face):
-					//   models({sessionId}) 读当前模型; selectModel({sessionId,provider,model,reasoningEffort}) 写/切档位。
-					// 这样📞的"快答/深思"自适应档位(进入保存/退出恢复)才能真实生效。
-					sessions: ctx.get("connection").api.sessions,
+					// 【模型接口修正·0.1.2】ctx.get("connection") 在 slot inject 闭包里已不可达(undefined → 席位崩溃)。
+					// 0.1.2 官方(ui-model-selection)直接用 ctx.sessions.selectModel({sessionId, provider, model, reasoningEffort});
+					// sessions 服务已在本插件 inject 声明,apply 层直接可拿(同 3117 行),闭包引用即可,不再连 connection。
+					sessions: ctx.sessions,
 				})
 			}, TelButton));
 			// 【设置页骨架】注册"语音"设置页。四标签壳，先只做"显示当前值 + 写字段 + 保存"。
