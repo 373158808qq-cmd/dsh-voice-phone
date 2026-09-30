@@ -20,3 +20,6 @@ node_modules/
 
 # 模型(体积大, 用下载脚本拉取)
 models/
+
+# 内部台账(含审查细节/决策记录,不进公开仓库)
+PROJECT_LEDGER.md

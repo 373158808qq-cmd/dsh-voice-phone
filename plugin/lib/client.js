@@ -847,7 +847,7 @@ window.__ModuleLoader__.load({
 		}
 		/** 【只停朗读声·不作废生成】引擎专用:开口时【只停当前朗读声音】,【不取消 agent 生成】、不作废在途文字。
 		*  用途:你开口先让声音立刻停,但留出约1秒判断你是"总结一下"还是"其它话";
-		*  若后续识别出"总结"→文字继续;若"其它话"→才由提交(steer)真正打断。 */
+		*  若后续识别出"总结"→文字继续;若"其它话"→由 turn 提交前对归属会话 cancel() 真正打断。 */
 		function callStopReadingSoundOnly() {
 			logReadingStop("callStopReadingSoundOnly");
 			callQueue = [];
@@ -2281,7 +2281,7 @@ window.__ModuleLoader__.load({
 						// 【barge-in·"声音立即断、文字延迟判停"】你开口→【只立即停朗读声音】,【不立即取消生成】。
 						// 留出时间识别你是"总结一下"还是"其它话":
 						//   - "总结" → 文字继续生成,调总结;
-						//   - "其它话" → 由下方提交(steer)真正打断生成。
+						//   - "其它话" → 由下方 turn 提交前对归属会话 cancel() 真正打断生成。
 						// (这样"总结"不会因为开口就被当作普通打断而停掉文字。)
 						logReadingStop("ws: speech_start");
 						if (typeof callStopReadingSoundOnly === "function") { try { callStopReadingSoundOnly(); } catch {} }
@@ -2349,12 +2349,19 @@ window.__ModuleLoader__.load({
 						// 切到别的会话时,这里的归属仍是 A(模块级变量,跟着通话走),不读其它会话。
 						voiceInputSessionId = globalCallSessionId;
 						voiceInputIsCall = true; // 这是📞通话 → 该回复朗读走 B1 边生成边逐句念
+						// 【P1·真打断】0.1.2 的 submit 参数被忽略(只排队),原"steer 打断"失效。
+						// 提交前先对通话归属会话 A 调会话级 cancel(与🎙️按住说同一通道),真正停掉上一轮文字生成。
+						// 只在"引擎正在读上一条回复(callArmed)"时打断;首次开口无上一条则直接提交。
+						// "总结一下"在更早分支已 return,走不到这里 → 总结不打断文字的行为不变。
+						if (callArmed) {
+							try { resolveSessionCancel(globalCallSessionId)(); } catch (e) { console.warn("[dsh-voice] tel cancel failed", e?.message); }
+						}
 						// 【自适应推理】按这轮内容判断要不要深思考,并临时调本会话模型选择(📞期间;退出恢复)
 						try { await applyEffort(turnText); } catch (e) { console.warn("[dsh-voice] tel applyEffort failed", e?.message); }
 						// 【B1】📞:用"边生成边逐句念"指南,让 agent 写可直接朗读的口语正文(不再要求 <speak> 标签)
 						const draft = B1_GUIDE + "\n\n" + turnText;
 						if (typeof inputActions?.setDraft === "function") inputActions.setDraft(draft);
-						if (typeof inputActions?.submit === "function") inputActions.submit("steer");
+						if (typeof inputActions?.submit === "function") inputActions.submit();
 					}
 				};
 				// 【防幽灵通话】WS 被异常断开/出错时,若本 WS 仍是通话所有者,就清掉全局通话标志。

@@ -1,25 +1,18 @@
 # -*- coding: utf-8 -*-
-"""stt_server.py — 独立 SenseVoice STT HTTP 服务 (本地模型, GPU/CPU)。
+"""stt_server.py — 独立 whisper STT HTTP 服务 (faster-whisper, GPU)。
 
-供 dsh-voice-phone 插件调用: POST /stt 收音频字节(建议 wav), 返 {"text": "..."};
-WS /voice/stream 收 16k int16 流, Silero VAD 检测语音结束(EOU)后转写返回 {type:'turn',text}。
-- 端口默认: 9881
-- 模型路径可用命令行参数覆盖(见文件末尾 argparse):
-    --sensevoice-dir  SenseVoice 模型目录
-    --modelscope-cache  modelscope 缓存目录(标点模型等)
-- 首次运行需要模型: 请先跑 scripts/download_models.py 自动下载。
-
-启动示例:
-  python stt_server.py --port 9881 --sensevoice-dir <SenseVoice模型目录>
+供 dsh-voice 宿主插件调用: POST /stt 收音频字节(建议 wav), 返 {"text": "..."}。
+- 端口: 9881 (与 GPT-SoVITS 9880 分开)
+- 音频解码用 faster_whisper.decode_audio(基于 av, 不需要外部 ffmpeg)
+  → 支持 wav / mp3 / webm / opus / flac 等 av 能解的格式
+覆盖:
+  E:\GPT-SoVITS\.venv\Scripts\python.exe E:\deepseekharness使用\voice\stt_server.py --port 9881
 """
 import os, io, json, time, argparse, warnings
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-# modelscope 缓存目录(标点模型等);默认放当前目录下的 models_cache,可用 --modelscope-cache 覆盖
-os.environ["MODELSCOPE_CACHE"] = os.environ.get(
-    "DSH_VOICE_MODELSCOPE_CACHE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_cache"),
-)
+# 让 FunASR/modelscope 把标点模型缓存到 E 盘(AI 专用目录),避免占用户 C 盘
+os.environ["MODELSCOPE_CACHE"] = r"E:\GPT-SoVITS\GPT_SoVITS\pretrained_models\punc_ct-transformer"
 
 warnings.filterwarnings("ignore")
 
@@ -30,9 +23,9 @@ import numpy as np
 import torch
 from silero_vad import load_silero_vad, VADIterator
 
-# SenseVoice 模型目录(默认 models_cache 下;可用 --sensevoice-dir 覆盖)
-SENSEVOICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_cache", "SenseVoiceSmall")
-# FunASR 中文标点恢复模型
+# SenseVoice 本地快照(轻量、省显存、中文好;已下载,无需联网)
+SENSEVOICE_DIR = r"E:\GPT-SoVITS\pretrained_models\models\iic--SenseVoiceSmall\snapshots\master"
+# FunASR 中文标点恢复模型(已装到 E 盘)
 PUNC_MODEL = "ct-punc"
 
 app = FastAPI(title="dsh-voice STT")
@@ -209,16 +202,8 @@ async def voice_stream(ws: WebSocket):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="dsh-voice-phone STT server (SenseVoice + Silero VAD)")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9881)
-    ap.add_argument("--sensevoice-dir", default=SENSEVOICE_DIR,
-                    help="SenseVoice 模型目录(默认: %(default)s)")
-    ap.add_argument("--modelscope-cache", default=os.environ["MODELSCOPE_CACHE"],
-                    help="modelscope 缓存目录(标点模型等, 默认: %(default)s)")
     args = ap.parse_args()
-    if args.sensevoice_dir:
-        SENSEVOICE_DIR = args.sensevoice_dir
-    if args.modelscope_cache:
-        os.environ["MODELSCOPE_CACHE"] = args.modelscope_cache
     uvicorn.run(app, host=args.host, port=args.port)

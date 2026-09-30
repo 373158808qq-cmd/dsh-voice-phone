@@ -1,34 +1,35 @@
 # -*- coding: utf-8 -*-
-"""CosyVoice2 TTS HTTP 服务(零样本克隆音色, 本地模型)。
+"""CosyVoice2 TTS HTTP 服务(零样本克隆 zry 音色)。
+接口与 GPT-SoVITS /tts 大致兼容:POST {"text": "...", "streaming_mode": bool, ...}
+其它 GPT-SoVITS 字段(参考/音色等)忽略,统一用下面固定的 zry 参考做克隆。
+端口 9882(可与 GPT-SoVITS 9880 并存)。
 
-接口兼容: POST /tts {"text": "...", "spk": "..."} → 返回 WAV; POST /prewarm 预热音色。
-端口默认 9882。
+【真流式 ▲▲▲】/tts?streaming_mode=true 时不再 torch.cat 整段,而是用
+inference_zero_shot(..., stream=True) 增量出块 + StreamingResponse:
+  先发 1 个 44 字节标准 PCM WAV 头(取采样率),之后每合成一块就 yield 一段原始
+  int16 PCM(不重复发头),前端 createReplySpeaker 的 speakStreaming 据此"边收边播"。
+这会把首包延迟从 ~1.7-2.2s(整段合成)降到 ~0.4-0.9s(首块即出)。
 
-【真流式】前端 /api/tts?streaming=1 走 /voice/streaming 增量出块: 先发 44 字节 WAV 头,
-之后每合成一块 yield 原始 int16 PCM, 前端"边收边播", 首包延迟 ~0.4-0.9s。
+【参考特征缓存】用 CosyVoice 自带 add_zero_shot_spk(prompt_text, prompt_wav, spk_id)
+把参考音频的 prompt 特征(prompt_text/speech_feat/speech_token/embedding)一次性算好
+存入 frontend.spk2info,随后 inference_zero_shot(..., zero_shot_spk_id=spk_id) 直接复用,
+省掉每次 /tts 请求重新做 whisper log-mel + speech_tokenizer + campplus。仅第一次 get_cosy
+构建时有开销(几十 ms~几百 ms)。
 
-【参考音频】CosyVoice 要求参考音频 ≤30s 并有逐字文字稿。默认音色仓库内
-voice-samples/ref.wav + ref.txt, 用户可放自己 ≤30s 的音色切片与文字稿, 或用命令行覆盖。
-
-【路径覆盖】可用命令行参数(见文件末尾):
-  --repo            CosyVoice 源码目录(含 cosyvoice 包, third_party/Matcha-TTS)
-  --model-dir       CosyVoice2 模型目录
-  --voices-dir      音色库目录(默认仓库 voice-samples/, 内含 manifest.json + 各音色 wav)
-  --ref-wav/--ref-text  默认音色参考(不指定则用 voice-samples/ref.wav + ref.txt)
-
-启动示例:
-  python tts_server.py --port 9882 --repo <CosyVoice源码目录> --model-dir <模型目录>
+【参考音频】CosyVoice frontend._extract_speech_token 有"参考音频 ≤30s"的硬性断言:
+  assert speech.shape[1] / 16000 <= 30
+而 E:\\zry音色.wav 实测 49.18s/44100/双声道,直接作为 prompt_wav 会触发断言失败。
+因此本服务仍用 4.2s 的微调片段 zry_0025640_0029860.wav + 其对应文字("人最早能记得
+两三岁时候的事",已验证能稳定克隆出 zry 音色)。若要在 CosyVoice 换用更长参考,需先
+由用户提供一段 ≤30s 的参考切片 + 与之逐字一致的文字稿,再改下面的 REF_WAV/REF_TEXT。
 """
-import os, sys, io, struct, json, argparse
+import os, sys, io, struct, json
 sys.stdout.reconfigure(encoding="utf-8")
 
-# 仓库根 = 本文件上两级(backend/tts 上两级是仓库根)
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-REPO = os.environ.get("DSH_VOICE_COSY_REPO", "")
-MATCHA = os.path.join(REPO, "third_party", "Matcha-TTS") if REPO else ""
+REPO = r"E:\CosyVoice\repo\QwenAudio-CosyVoice-074ca6d"
+MATCHA = REPO + r"\third_party\Matcha-TTS"
 for p in (REPO, MATCHA):
-    if p and p not in sys.path:
+    if p not in sys.path:
         sys.path.insert(0, p)
 
 import soundfile as sf
@@ -37,13 +38,14 @@ from fastapi.responses import StreamingResponse
 import torch, torchaudio
 from cosyvoice.cli.cosyvoice import CosyVoice2
 
-MODEL_DIR = os.path.join(_REPO_ROOT, "models", "CosyVoice2-0.5B")
-REF_WAV = os.path.join(_REPO_ROOT, "voice-samples", "ref.wav")
-REF_TEXT = ""
-VOICES_MANIFEST = os.path.join(_REPO_ROOT, "voice-samples", "manifest.json")
+MODEL_DIR = r"E:\CosyVoice\pretrained_models\models\iic--CosyVoice2-0.5B\snapshots\master"
+REF_WAV = r"E:\GPT-SoVITS\dataset\zry\clips\zry_0025640_0029860.wav"
+REF_TEXT = "人最早能记得两三岁时候的事"
 # 缓存参考特征用的零样本 speak id(见文件头注释)。
-ZERO_SHOT_SPK_ID = "default"
-DEFAULT_SPK = "default"
+ZERO_SHOT_SPK_ID = "zry"
+DEFAULT_SPK = "zry"
+# 【多音色】音色库清单:由宿主端(插件)在新增/删除音色时写入,tts_server 每次 /tts 读取以支持"切音色即刻生效"。
+VOICES_MANIFEST = r"E:\deepseekharness使用\plugins\dsh-client-ui-voice-input\runtime\voices\manifest.json"
 # 已缓存参考特征的 spk 集合(避免重复 add_zero_shot_spk)。
 _cached_spks = set()
 
@@ -158,28 +160,4 @@ async def prewarm(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    ap = argparse.ArgumentParser(description="dsh-voice-phone TTS server (CosyVoice2 zero-shot clone)")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=9882)
-    ap.add_argument("--repo", default=REPO, help="CosyVoice 源码目录(含 cosyvoice 包 + third_party/Matcha-TTS)")
-    ap.add_argument("--model-dir", default=MODEL_DIR, help="CosyVoice2 模型目录")
-    ap.add_argument("--voices-dir", default=os.path.dirname(VOICES_MANIFEST), help="音色库目录(含 manifest.json 和各音色 wav)")
-    ap.add_argument("--ref-wav", default=REF_WAV, help="默认音色参考音频 wav (≤30s)")
-    ap.add_argument("--ref-text", default=REF_TEXT, help="默认音色参考文字稿")
-    args = ap.parse_args()
-    # 应用命令行参数到全局(在首次 get_cosy/load_voices 前生效)
-    if args.repo:
-        REPO = args.repo
-        MATCHA = os.path.join(REPO, "third_party", "Matcha-TTS")
-        for p in (REPO, MATCHA):
-            if p and p not in sys.path:
-                sys.path.insert(0, p)
-    if args.model_dir:
-        MODEL_DIR = args.model_dir
-    if args.voices_dir:
-        VOICES_MANIFEST = os.path.join(args.voices_dir, "manifest.json")
-    if args.ref_wav:
-        REF_WAV = args.ref_wav
-    if args.ref_text:
-        REF_TEXT = args.ref_text
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host="127.0.0.1", port=9882)

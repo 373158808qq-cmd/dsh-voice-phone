@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-phone-ui-input",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Voice phone-call UI plugin for DSH Web: real-time voice call with TTS reading of replies, barge-in, mute, and voice cloning (CosyVoice).",
   "type": "module",
   "main": "lib/index.js",

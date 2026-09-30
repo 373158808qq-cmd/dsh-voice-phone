@@ -1,17 +1,34 @@
 # dsh-voice-phone-ui-input
 
-**DSH Web 实时语音通话插件** — 在 DeepSeek Harness Web 里开一个"📞 电话会议"：
+<p align="center">
+  <strong>DSH Web 实时语音通话插件 —— 用你的克隆音色，跟 DeepSeek 打电话</strong><br>
+  <sub>你说 → Agent 答 → 用你自己的声音实时念出来</sub>
+</p>
 
-- 你说话 → 本地语音识别（SenseVoice + Silero VAD）→ Agent 作答
-- Agent 回复 → **用你的克隆音色** 实时朗读（CosyVoice2 零样本克隆）
-- 支持 **打断**（barge-in）、**静音**（只静音不打断）、**正在说的话**（流式朗读）、**"总结一下"**（只取当前一轮对话的口语总结）
-- 全本地、低延迟、免 API Key（也可选云端 API）
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="https://github.com/373158808qq-cmd/dsh-voice-phone/releases"><img src="https://img.shields.io/github/v/release/373158808qq-cmd/dsh-voice-phone" alt="Release"></a>
+  <a href="https://github.com/373158808qq-cmd/dsh-voice-phone/stargazers"><img src="https://img.shields.io/github/stars/373158808qq-cmd/dsh-voice-phone" alt="Stars"></a>
+  <a href="https://github.com/373158808qq-cmd/dsh-voice-phone/issues"><img src="https://img.shields.io/github/issues/373158808qq-cmd/dsh-voice-phone" alt="Issues"></a>
+</p>
 
-> 架构：前端插件（DSH 浏览器端）+ 两个本地 Python 后端服务（识别 9881 / 合成 9882）。后端模型离线可跑，有声卡即可。
+> 在 DeepSeek Harness Web 里，点一下 📞 —— 你说的话：**本地识别**→ Agent 回答 → **用你的克隆音色实时朗读**。像打电话一样，开口就能打断、静音、随时总结。
 
 ---
 
-## 目录结构
+## ✨ 亮点
+
+- 🎙️ **你的声音** —— CosyVoice2 **零样本克隆**，上传 ≤30s 参考音频即成音色（不是真训练，快、省显存）
+- ⚡ **低延迟** —— 本地 SenseVoice + Silero VAD 识别（≈0.5s），流式 TTS 合成（≈2.7s），边说边出
+- 🗣️ **真打断** —— 你开口即停、转到听你说（不等说完）
+- 🔇 **静音不打断** —— 只静音朗读、识别/状态机照常
+- 📝 **"总结一下"** —— 只取当前这一轮对话，口语总结念出（不写屏、不打断文字生成）
+- 🧩 **全本地 / 可 API** —— 本地免 Key、零网络；也支持云端 API（STT/TTS 各配各的，同 Key 联动启停）
+- 💻 **跨会话/多卡** —— 通话跨会话常驻，可指定 GPU（多卡环境）
+
+> 架构：前端插件（DSH 浏览器端）+ 两个本地 Python 后端服务（识别 9881 / 合成 9882）。模型离线可跑，有声卡即可。
+
+## 📦 目录结构
 
 ```
 dsh-voice-phone/
@@ -24,6 +41,8 @@ dsh-voice-phone/
 ├── models/                  # 模型目录 (下载脚本自动放入)
 └── plugin/                  # 前端插件 (DSH 安装用)
 ```
+
+> **注意**：`voice-samples/`（你的音色 wav）**绝不入库**（`.gitignore` 已排除），只放你自己本地。
 
 ## 前置要求
 
